@@ -6,9 +6,13 @@ import gradio as gr
 import torch
 import transformers
 from peft import PeftModel
-from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer
 
 from utils.prompter import Prompter
+from typing import Optional, List, Mapping, Any
+from llama_index import SimpleDirectoryReader, GPTListIndex, PromptHelper
+from llama_index import LLMPredictor, ServiceContext
+from langchain.llms.base import LLM
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -26,8 +30,10 @@ def main(
     load_8bit: bool = False,
     base_model: str = "",
     lora_weights: str = "tloen/alpaca-lora-7b",
-    prompt_template: str = "",  # The prompt template to use, will default to alpaca.
-    server_name: str = "0.0.0.0",  # Allows to listen on all interfaces by providing '0.
+    # The prompt template to use, will default to alpaca.
+    prompt_template: str = "",
+    # Allows to listen on all interfaces by providing '0.
+    server_name: str = "0.0.0.0",
     share_gradio: bool = False,
 ):
     base_model = base_model or os.environ.get("BASE_MODEL", "")
@@ -37,12 +43,13 @@ def main(
 
     prompter = Prompter(prompt_template)
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
+    print(device)
     if device == "cuda":
         model = LlamaForCausalLM.from_pretrained(
             base_model,
             load_in_8bit=load_8bit,
             torch_dtype=torch.float16,
-            device_map="auto",
+            device_map={'': 0},
         )
         model = PeftModel.from_pretrained(
             model,
@@ -83,6 +90,69 @@ def main(
     if torch.__version__ >= "2" and sys.platform != "win32":
         model = torch.compile(model)
 
+    # define prompt helper
+    # set maximum input size
+    max_input_size = 2048
+    # set number of output tokens
+    num_output = 200
+    # set maximum chunk overlap
+    max_chunk_overlap = 20
+
+    class CustomLLM(LLM):
+        model_name = 'decapoda-research/llama-7b-hf'
+        pipeline = transformers.pipeline(
+            task='text-generation',
+            model=model,
+            tokenizer=tokenizer,
+            device="cuda:0",
+        )
+        temperature = 0.4
+        top_p = 0.75
+        top_k = 30
+        num_beams = 1
+        max_new_tokens = 128
+        repetition_penalty = 1.3
+
+        def set_params(self, temperature=0.1, top_p=0.75, top_k=40, num_beams=4, max_new_tokens=128):
+            super().__init__()
+            self.temperature = temperature
+            self.top_p = top_p
+            self.top_k = top_k
+            self.num_beams = num_beams
+            self.max_new_tokens = max_new_tokens
+
+        def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+            prompt_len = len(prompt)
+            response = self.pipeline(
+                prompt,
+                max_new_tokens=self.max_new_tokens,
+                repetition_penalty=self.repetition_penalty,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+                num_beams=self.num_beams,
+                stop_sequence=["."]
+            )[0]["generated_text"]
+            return response[prompt_len:]
+
+        @property
+        def _identifying_params(self) -> Mapping[str, Any]:
+            return {"name_of_model": self.model_name}
+
+        @property
+        def _llm_type(self) -> str:
+            return "custom"
+
+    prompt_helper = PromptHelper(max_input_size, num_output, max_chunk_overlap)
+    llm = CustomLLM()
+    llm_predictor = LLMPredictor(llm=llm)
+    service_context = ServiceContext.from_defaults(
+        llm_predictor, prompt_helper)
+
+    documents = SimpleDirectoryReader('./documentation').load_data()
+    index = GPTListIndex.from_documents(
+        documents, service_context=service_context)
+
     def evaluate(
         instruction,
         input=None,
@@ -93,27 +163,7 @@ def main(
         max_new_tokens=128,
         **kwargs,
     ):
-        prompt = prompter.generate_prompt(instruction, input)
-        inputs = tokenizer(prompt, return_tensors="pt")
-        input_ids = inputs["input_ids"].to(device)
-        generation_config = GenerationConfig(
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            num_beams=num_beams,
-            **kwargs,
-        )
-        with torch.no_grad():
-            generation_output = model.generate(
-                input_ids=input_ids,
-                generation_config=generation_config,
-                return_dict_in_generate=True,
-                output_scores=True,
-                max_new_tokens=max_new_tokens,
-            )
-        s = generation_output.sequences[0]
-        output = tokenizer.decode(s)
-        return prompter.get_response(output)
+        return index.query(instruction)
 
     gr.Interface(
         fn=evaluate,
