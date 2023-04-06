@@ -28,7 +28,7 @@ except:  # noqa: E722
 
 def main(
     load_8bit: bool = False,
-    base_model: str = "",
+    base_model: str = "decapoda-research/llama-7b-hf",
     lora_weights: str = "tloen/alpaca-lora-7b",
     # The prompt template to use, will default to alpaca.
     prompt_template: str = "",
